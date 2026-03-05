@@ -1,38 +1,39 @@
 """
-990 Foundation Explorer
------------------------
-Pulls IRS 990/990PF data from the ProPublica Nonprofit Explorer API
-for a user-supplied list of EINs, then exports a filtered spreadsheet.
+990 Foundation Explorer — Local XML Edition
+--------------------------------------------
+Reads IRS 990/990PF XML files from a local folder structure, matched by EIN
+via an index CSV, and exports a filtered spreadsheet.
 
-API docs: https://projects.propublica.org/nonprofits/api/
-Endpoint: GET https://projects.propublica.org/nonprofits/api/v2/organizations/{ein}.json
-
-Response shape:
-  organization        – org-level profile (name, address, NTEE, ruling date, etc.)
-  filings_with_data   – one row per filing year with financial summary fields
-                        (field set varies by form type: 990, 990-EZ, 990-PF)
-  filings_without_data – years where only a PDF exists, no structured data
-
-This app uses the most recent filing row from filings_with_data for financials,
-combined with the organization-level fields, to build one row per EIN.
+Expected inputs:
+  - XML root folder: directory containing subfolders named by XML_BATCH_ID,
+                     each containing files named {OBJECT_ID}_public.xml
+  - Index CSV:       must contain columns EIN, OBJECT_ID (clean integer), XML_BATCH_ID
+                     Additional columns (TAX_PERIOD, RETURN_TYPE, etc.) are used
+                     for metadata but are not required.
+  - EIN list:        one EIN per line, dashes optional
 
 Flow:
-  Step 1 – Paste EINs
-  Step 2 – Fetch all EINs; raw data stored in session state
-  Step 3 – Select which fields to keep (derived from actual API response keys)
-  Step 4 – Preview + download
+  Step 1 – Provide paths + EINs
+  Step 2 – Parse matched XML files; all fields unioned across all files
+  Step 3 – Uncheck fields to exclude
+  Step 4 – Preview + download (one row per filing, all filings per EIN)
 
-Notes:
-- ProPublica data lags the IRS by roughly 6–12 months.
-- 990-PF fields are present only when formtype indicates PF; blank otherwise.
-- No API key required; 0.5s delay between requests out of courtesy.
+XML parsing strategy:
+  - Namespace-agnostic: strips {namespace} prefixes from all tags
+  - Flattens nested elements with dot-notation keys (e.g. Filer.USAddress.CityNm)
+  - Repeating groups (e.g. multiple officers) are serialised as JSON strings
+    in a single cell — one column per repeating group type
+  - Fields from ReturnHeader and the primary IRS990/IRS990PF element are merged
+    into one row per filing
 """
 
-import time
-import re
 import io
+import json
+import os
+import re
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 
-import requests
 import pandas as pd
 import streamlit as st
 
@@ -40,205 +41,226 @@ import streamlit as st
 # Constants
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://projects.propublica.org/nonprofits/api/v2/organizations/{ein}.json"
+# Index CSV column names — adjust here if your CSV uses different names
+COL_EIN = "EIN"
+COL_OBJECT_ID = "OBJECT_ID"
+COL_BATCH_ID = "XML_BATCH_ID"
 
-# Human-readable labels for known API keys.
-# Any key not listed here is displayed as the raw key name.
-KEY_LABELS = {
-    "ein": "EIN",
-    "name": "Organization Name",
-    "careofname": "Care Of Name",
-    "address": "Address",
-    "city": "City",
-    "state": "State",
-    "zipcode": "ZIP",
-    "phone": "Phone",
-    "website": "Website",
-    "ntee_code": "NTEE Code",
-    "subseccd": "Subsection Code",
-    "ruling": "Ruling Date",
-    "classification_codes": "Classification Codes",
-    "exempt_status_code": "Exempt Status Code",
-    "asset_amount": "Asset Amount (BMF)",
-    "income_amount": "Income Amount (BMF)",
-    "revenue_amount": "Revenue Amount (BMF)",
-    "filing_requirement_code": "Filing Requirement Code",
-    "pf_filing_requirement_code": "PF Filing Requirement Code",
-    "accounting_period": "Accounting Period",
-    "tax_prd_yr": "Most Recent Tax Year",
-    "tax_prd": "Tax Period",
-    "formtype_str": "Form Type",
-    "updated": "Filing Updated",
-    "totrevenue": "Total Revenue",
-    "totfuncexpns": "Total Functional Expenses",
-    "totassetsend": "Total Assets (EOY)",
-    "totliabend": "Total Liabilities (EOY)",
-    "totnetassetsend": "Net Assets (EOY)",
-    "totcntrbs": "Total Contributions",
-    "prgmservrev": "Program Service Revenue",
-    "invstmntinc": "Investment Income",
-    "othrevnue": "Other Revenue",
-    "grsrevnuefndrsng": "Fundraising Gross Revenue",
-    "direxpns": "Fundraising Direct Expenses",
-    "netincfndrsng": "Net Fundraising Income",
-    "unrelbusincd": "Unrelated Business Income (Y/N)",
-    "unrelbusinccd": "Unrelated Business Income Code",
-    "pct_compnsatncurrofcr": "Officer Compensation %",
-    "compnsatncurrofcr": "Officer Compensation",
-    "othrsalwages": "Other Salaries & Wages",
-    "payrolltx": "Payroll Tax",
-    "profndraising": "Professional Fundraising",
-    "totexcessyr": "Excess/Deficit for Year",
-    "othrchgsnetassetfnd": "Other Changes in Net Assets",
-    "initiationfee": "Initiation Fees",
-    "grsincgaming": "Gross Gaming Income",
-    "gftgrntrcvd170": "Gifts/Grants Received (170)",
-    "gftgrntsrcvd170": "Gifts/Grants Received (170b)",
-    "grspublicrcpts": "Gross Public Receipts",
-    "totsupp509": "Total Support (509)",
-    "totgftgrntrcvd509": "Total Gifts/Grants (509)",
-    "grsrcptsrelatd170": "Gross Receipts Related (170)",
-    "grsrcptsrelated170": "Gross Receipts Related (170b)",
-    "grsrcptsadmiss509": "Gross Receipts Admissions (509)",
-    "grsrcptsadmissn509": "Gross Receipts Admissions (509b)",
-    "nonpfrea": "Non-PF Reason Code",
-    "txrevnuelevied170": "Tax Revenue Levied (170)",
-    "txrevnuelevied509": "Tax Revenue Levied (509)",
-    "srvcsval170": "Services Value (170)",
-    "srvcsval509": "Services Value (509)",
-    "grsinc170": "Gross Income (170)",
-    "grsincmembers": "Gross Income from Members",
-    "grsincother": "Gross Income Other",
-    "totcntrbgfts": "Total Contributions & Gifts",
-    "totprgmrevnue": "Total Program Revenue",
-    "txexmptbndsproceeds": "Tax-Exempt Bond Proceeds",
-    "txexmptbndsend": "Tax-Exempt Bonds (EOY)",
-    "royaltsinc": "Royalties Income",
-    "grsrntsreal": "Gross Rents (Real)",
-    "grsrntsprsnl": "Gross Rents (Personal)",
-    "rntlexpnsreal": "Rental Expenses (Real)",
-    "rntlexpnsprsnl": "Rental Expenses (Personal)",
-    "rntlincreal": "Rental Income (Real)",
-    "rntlincprsnl": "Rental Income (Personal)",
-    "netrntlinc": "Net Rental Income",
-    "grsalesecur": "Gross Sales (Securities)",
-    "grsalesothr": "Gross Sales (Other)",
-    "cstbasisecur": "Cost Basis (Securities)",
-    "cstbasisothr": "Cost Basis (Other)",
-    "gnlsecur": "Gain/Loss (Securities)",
-    "gnlsothr": "Gain/Loss (Other)",
-    "netgnls": "Net Gains/Losses",
-    "grsincfndrsng": "Gross Fundraising Income",
-    "lessdirfndrsng": "Less Direct Fundraising",
-    "lessdirgaming": "Less Direct Gaming",
-    "netincgaming": "Net Gaming Income",
-    "grsalesinvent": "Gross Sales (Inventory)",
-    "lesscstofgoods": "Less Cost of Goods",
-    "netincsales": "Net Income from Sales",
-    "miscrevtot11e": "Miscellaneous Revenue",
-    "secrdmrtgsend": "Secured Mortgages (EOY)",
-    "unsecurednotesend": "Unsecured Notes (EOY)",
-    "retainedearnend": "Retained Earnings (EOY)",
-    "totnetassetend": "Total Net Assets (EOY)",
-    "grsalesminusret": "Gross Sales Minus Returns",
-    "costgoodsold": "Cost of Goods Sold",
-    "grsprft": "Gross Profit",
-    "duesassesmnts": "Dues & Assessments",
-    "othrinvstinc": "Other Investment Income",
-    "grsamtsalesastothr": "Gross Amount Sales (Other Assets)",
-    "basisalesexpnsothr": "Basis/Sales Expenses (Other)",
-    "gnsaleofastothr": "Gain on Sale (Other Assets)",
-    "subtotsuppinc509": "Subtotal Support Income (509)",
-    "totgftgrntrcvd170": "Total Gifts/Grants (170)",
+# XML elements to parse as the primary return body.
+# Any tag not in this list that appears under ReturnData is also captured.
+PRIMARY_RETURN_ELEMENTS = {"IRS990", "IRS990PF", "IRS990EZ", "IRS990T"}
+
+# Tags to skip entirely (binary/boilerplate, not useful as data fields)
+SKIP_TAGS = {"BuildTS", "softwareId", "softwareVersionNum", "returnVersion",
+             "documentCnt", "binaryAttachmentCnt", "xsi:schemaLocation"}
+
+# Human-readable labels for common fields. Raw tag names are used for anything
+# not listed here — they're already fairly readable (CamelCase IRS tag names).
+FIELD_LABELS = {
+    "ReturnHeader.ReturnTs":                        "Filing Timestamp",
+    "ReturnHeader.TaxPeriodEndDt":                  "Tax Period End",
+    "ReturnHeader.TaxPeriodBeginDt":                "Tax Period Begin",
+    "ReturnHeader.TaxYr":                           "Tax Year",
+    "ReturnHeader.ReturnTypeCd":                    "Return Type",
+    "ReturnHeader.Filer.EIN":                       "EIN",
+    "ReturnHeader.Filer.BusinessName.BusinessNameLine1Txt": "Organization Name",
+    "ReturnHeader.Filer.BusinessName.BusinessNameLine2Txt": "Organization Name (Line 2)",
+    "ReturnHeader.Filer.PhoneNum":                  "Phone",
+    "ReturnHeader.Filer.USAddress.AddressLine1Txt": "Address",
+    "ReturnHeader.Filer.USAddress.CityNm":          "City",
+    "ReturnHeader.Filer.USAddress.StateAbbreviationCd": "State",
+    "ReturnHeader.Filer.USAddress.ZIPCd":           "ZIP",
+    "ReturnHeader.BusinessOfficerGrp.PersonNm":     "Signing Officer Name",
+    "ReturnHeader.BusinessOfficerGrp.PersonTitleTxt": "Signing Officer Title",
+    "ReturnHeader.BusinessOfficerGrp.PhoneNum":     "Signing Officer Phone",
+    "ReturnHeader.PreparerFirmGrp.PreparerFirmName.BusinessNameLine1Txt": "Preparer Firm",
+    "ReturnHeader.PreparerPersonGrp.PreparerPersonNm": "Preparer Name",
+    "ReturnHeader.PreparerPersonGrp.PhoneNum":      "Preparer Phone",
 }
 
-# Keys checked by default in Step 3
-DEFAULT_CHECKED_KEYS = {
-    "ein", "name", "address", "city", "state", "zipcode", "phone", "website",
-    "ntee_code", "ruling",
-    "tax_prd_yr", "formtype_str",
-    "totrevenue", "totfuncexpns", "totassetsend", "totliabend", "totnetassetsend",
-    "totcntrbs", "prgmservrev",
+# Fields checked by default in Step 3
+DEFAULT_CHECKED = {
+    "ReturnHeader.TaxYr",
+    "ReturnHeader.ReturnTypeCd",
+    "ReturnHeader.TaxPeriodEndDt",
+    "ReturnHeader.Filer.EIN",
+    "ReturnHeader.Filer.BusinessName.BusinessNameLine1Txt",
+    "ReturnHeader.Filer.PhoneNum",
+    "ReturnHeader.Filer.USAddress.AddressLine1Txt",
+    "ReturnHeader.Filer.USAddress.CityNm",
+    "ReturnHeader.Filer.USAddress.StateAbbreviationCd",
+    "ReturnHeader.Filer.USAddress.ZIPCd",
+    "ReturnHeader.BusinessOfficerGrp.PersonNm",
+    "ReturnHeader.BusinessOfficerGrp.PersonTitleTxt",
+    "ReturnHeader.BusinessOfficerGrp.PhoneNum",
 }
 
 # ---------------------------------------------------------------------------
-# Helpers
+# XML parsing
 # ---------------------------------------------------------------------------
 
-def clean_ein(raw: str) -> str:
-    """Strip non-digits from an EIN string."""
-    return re.sub(r"\D", "", raw.strip())
+def strip_ns(tag: str) -> str:
+    """Remove XML namespace prefix from a tag: '{http://...}TagName' -> 'TagName'."""
+    return re.sub(r"^\{[^}]+\}", "", tag)
 
 
-def fetch_org(ein: str) -> dict:
+def flatten_element(el: ET.Element, prefix: str = "") -> tuple[dict, dict]:
     """
-    Call the ProPublica API for one EIN.
-    Returns: {'organization': dict, 'filings_with_data': list, 'error': str|None}
+    Recursively flatten an XML element into a dict of dot-notation key -> value.
+    Returns:
+      scalar_fields  – {key: value} for leaf text nodes
+      repeated_fields – {key: [list of dicts]} for elements that appear >1 time
+                        under the same parent (e.g. officer groups)
+
+    Repeated elements are detected at parse time and stored separately so the
+    caller can decide how to serialise them.
     """
-    url = BASE_URL.format(ein=ein)
-    try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 404:
-            return {"organization": {}, "filings_with_data": [], "error": "Not found in ProPublica"}
-        resp.raise_for_status()
-        data = resp.json()
-        return {
-            "organization": data.get("organization", {}),
-            "filings_with_data": data.get("filings_with_data", []),
-            "error": None,
-        }
-    except requests.exceptions.Timeout:
-        return {"organization": {}, "filings_with_data": [], "error": "Request timed out"}
-    except Exception as e:
-        return {"organization": {}, "filings_with_data": [], "error": str(e)}
+    scalar_fields = {}
+    repeated_fields = {}
 
+    # Count child tag occurrences to detect repeating groups
+    child_tag_counts = defaultdict(int)
+    for child in el:
+        child_tag_counts[strip_ns(child.tag)] += 1
 
-def flatten_result(result: dict) -> dict:
-    """
-    Merge org fields and most-recent filing fields into one flat dict.
-    Org keys overwrite filing keys on collision (org data is more authoritative
-    for shared fields like 'ein').
-    """
-    org = result.get("organization", {})
-    filings = result.get("filings_with_data", [])
-    filing = filings[0] if filings else {}
-
-    flat = {**filing, **org}  # org wins on collision
-    flat["_error"] = result.get("error")
-    return flat
-
-
-def collect_all_keys(raw_results: dict) -> list:
-    """
-    Return an ordered list of all non-internal keys that appear across all results.
-    Org-level keys come first (in first-seen order), then filing-only keys.
-    """
-    org_keys = []
-    filing_keys = []
-    org_keys_set = set()
-    filing_keys_set = set()
-
-    for ein, result in raw_results.items():
-        if result["error"]:
+    for child in el:
+        tag = strip_ns(child.tag)
+        if tag in SKIP_TAGS:
             continue
-        org = result.get("organization", {})
-        filings = result.get("filings_with_data", [])
-        filing = filings[0] if filings else {}
+        key = f"{prefix}.{tag}" if prefix else tag
+        children = list(child)
 
-        for k in org:
-            if k not in org_keys_set:
-                org_keys_set.add(k)
-                org_keys.append(k)
-        for k in filing:
-            if k not in org_keys_set and k not in filing_keys_set:
-                filing_keys_set.add(k)
-                filing_keys.append(k)
+        if child_tag_counts[tag] > 1:
+            # Repeating group — collect all siblings under parent key
+            if key not in repeated_fields:
+                repeated_fields[key] = []
+            if children:
+                sub_scalar, _ = flatten_element(child, prefix="")
+                repeated_fields[key].append(sub_scalar)
+            else:
+                repeated_fields[key].append(child.text or "")
+        elif children:
+            sub_scalar, sub_repeated = flatten_element(child, prefix=key)
+            scalar_fields.update(sub_scalar)
+            repeated_fields.update(sub_repeated)
+        else:
+            scalar_fields[key] = (child.text or "").strip()
 
-    return org_keys + filing_keys
+    return scalar_fields, repeated_fields
+
+
+def parse_xml_file(path: str) -> list[dict]:
+    """
+    Parse one XML file and return a list of row dicts (usually just one row,
+    but structured to allow for extension).
+
+    Merges ReturnHeader fields with the primary return body (IRS990, IRS990PF, etc.).
+    Repeating groups are JSON-serialised into a single column per group.
+    Prefixes header fields with 'ReturnHeader.' and body fields with the element
+    name (e.g. 'IRS990PF.') for unambiguous column naming.
+    """
+    try:
+        tree = ET.parse(path)
+    except ET.ParseError as e:
+        return [{"_parse_error": str(e), "_source_file": path}]
+
+    root = tree.getroot()
+    row = {"_source_file": path}
+    repeated = {}
+
+    # --- ReturnHeader ---
+    header_el = None
+    for child in root:
+        if strip_ns(child.tag) == "ReturnHeader":
+            header_el = child
+            break
+
+    if header_el is not None:
+        scalars, reps = flatten_element(header_el, prefix="ReturnHeader")
+        row.update(scalars)
+        repeated.update({f"ReturnHeader.{k}" if not k.startswith("ReturnHeader") else k: v
+                         for k, v in reps.items()})
+
+    # --- ReturnData: primary body element ---
+    for child in root:
+        if strip_ns(child.tag) != "ReturnData":
+            continue
+        for body_el in child:
+            tag = strip_ns(body_el.tag)
+            scalars, reps = flatten_element(body_el, prefix=tag)
+            row.update(scalars)
+            repeated.update(reps)
+        break  # only one ReturnData expected
+
+    # Serialise repeated groups as JSON strings
+    for key, items in repeated.items():
+        row[key] = json.dumps(items, ensure_ascii=False)
+
+    return [row]
+
+
+# ---------------------------------------------------------------------------
+# Index + file resolution
+# ---------------------------------------------------------------------------
+
+def load_index(csv_path: str) -> pd.DataFrame:
+    """Load and normalise the index CSV."""
+    df = pd.read_csv(csv_path, dtype={COL_OBJECT_ID: str, COL_EIN: str})
+    df[COL_EIN] = df[COL_EIN].str.strip().str.replace(r"\D", "", regex=True)
+    df[COL_OBJECT_ID] = df[COL_OBJECT_ID].str.strip()
+    df[COL_BATCH_ID] = df[COL_BATCH_ID].str.strip()
+    return df
+
+
+def resolve_filings(index_df: pd.DataFrame, eins: list[str]) -> pd.DataFrame:
+    """
+    Return all index rows matching the supplied EINs.
+    """
+    matched = index_df[index_df[COL_EIN].isin(set(eins))].copy()
+    return matched
+
+
+def xml_path(root_folder: str, batch_id: str, object_id: str) -> str:
+    return os.path.join(root_folder, batch_id, f"{object_id}_public.xml")
+
+
+# ---------------------------------------------------------------------------
+# Field ordering helpers
+# ---------------------------------------------------------------------------
+
+def ordered_columns(all_columns: list[str]) -> list[str]:
+    """
+    Return columns in a logical order:
+      1. ReturnHeader fields (identity + contact first)
+      2. IRS990PF fields
+      3. IRS990 fields
+      4. IRS990EZ fields
+      5. IRS990T fields
+      6. Everything else
+      7. Internal fields (_source_file, _parse_error) last
+    """
+    def sort_key(col):
+        if col.startswith("_"):
+            return (99, col)
+        if col.startswith("ReturnHeader.Filer"):
+            return (0, col)
+        if col.startswith("ReturnHeader"):
+            return (1, col)
+        if col.startswith("IRS990PF"):
+            return (2, col)
+        if col.startswith("IRS990."):
+            return (3, col)
+        if col.startswith("IRS990EZ"):
+            return (4, col)
+        if col.startswith("IRS990T"):
+            return (5, col)
+        return (6, col)
+
+    return sorted(all_columns, key=sort_key)
 
 
 def label_for(key: str) -> str:
-    return KEY_LABELS.get(key, key)
+    return FIELD_LABELS.get(key, key)
 
 
 # ---------------------------------------------------------------------------
@@ -247,140 +269,206 @@ def label_for(key: str) -> str:
 
 st.set_page_config(page_title="990 Foundation Explorer", layout="wide")
 st.title("990 Foundation Explorer")
-st.caption(
-    "Data sourced from the [ProPublica Nonprofit Explorer API](https://projects.propublica.org/nonprofits/api/). "
-    "Financial data reflects the most recently available filing. "
-    "ProPublica's dataset typically lags the IRS by 6–12 months."
-)
+st.caption("Parses local IRS 990/990PF XML files matched via an index CSV.")
 
-if "raw_results" not in st.session_state:
-    st.session_state.raw_results = {}
-if "all_keys" not in st.session_state:
-    st.session_state.all_keys = []
+if "parsed_df" not in st.session_state:
+    st.session_state.parsed_df = None
+if "all_columns" not in st.session_state:
+    st.session_state.all_columns = []
 
 # ---------------------------------------------------------------------------
-# Step 1: EIN input
+# Step 1: Inputs
 # ---------------------------------------------------------------------------
-st.header("Step 1 — Paste EINs")
-st.write("One EIN per line. Dashes optional (e.g. `23-7125454` or `237125454`).")
+st.header("Step 1 — Inputs")
 
-ein_input = st.text_area("EINs", height=180, placeholder="237125454\n330759830\n933607439")
+col_a, col_b = st.columns(2)
+
+with col_a:
+    xml_root = st.text_input(
+        "XML root folder path",
+        placeholder="/Users/you/irs_990_xmls",
+        help="Folder containing subfolders named by XML_BATCH_ID (e.g. 2025_TEOS_XML_12A/)",
+    )
+    index_path = st.text_input(
+        "Index CSV path",
+        placeholder="/Users/you/index_2025.csv",
+        help="Must contain columns: EIN, OBJECT_ID (clean integer), XML_BATCH_ID",
+    )
+
+with col_b:
+    ein_input = st.text_area(
+        "EINs (one per line, dashes optional)",
+        height=200,
+        placeholder="237125454\n330759830\n933607439",
+    )
 
 eins_raw = [line.strip() for line in ein_input.splitlines() if line.strip()]
-eins = [clean_ein(e) for e in eins_raw if clean_ein(e)]
+eins_cleaned = [re.sub(r"\D", "", e) for e in eins_raw if re.sub(r"\D", "", e)]
 
 seen = set()
 eins_deduped = []
-for e in eins:
+for e in eins_cleaned:
     if e not in seen:
         seen.add(e)
         eins_deduped.append(e)
 
 if eins_deduped:
     st.caption(f"{len(eins_deduped)} unique EIN(s) entered.")
-    if len(eins_deduped) != len(eins):
-        st.warning(f"{len(eins) - len(eins_deduped)} duplicate(s) removed.")
+    if len(eins_cleaned) != len(eins_deduped):
+        st.warning(f"{len(eins_cleaned) - len(eins_deduped)} duplicate(s) removed.")
 
 # ---------------------------------------------------------------------------
-# Step 2: Fetch
+# Step 2: Parse
 # ---------------------------------------------------------------------------
-st.header("Step 2 — Fetch Data")
+st.header("Step 2 — Parse XML Files")
 
-if not eins_deduped:
-    st.info("Enter at least one EIN above to continue.")
+inputs_ready = xml_root and index_path and eins_deduped
+
+if not inputs_ready:
+    st.info("Complete all inputs above to continue.")
 else:
-    if st.button("Fetch Data", type="primary"):
-        raw_results = {}
+    if st.button("Parse Files", type="primary"):
+        errors = []
+
+        # Load index
+        if not os.path.isfile(index_path):
+            st.error(f"Index CSV not found: {index_path}")
+            st.stop()
+        if not os.path.isdir(xml_root):
+            st.error(f"XML root folder not found: {xml_root}")
+            st.stop()
+
+        with st.spinner("Loading index CSV…"):
+            try:
+                index_df = load_index(index_path)
+            except Exception as e:
+                st.error(f"Failed to load index CSV: {e}")
+                st.stop()
+
+        filings = resolve_filings(index_df, eins_deduped)
+
+        if filings.empty:
+            st.error("None of the supplied EINs were found in the index CSV.")
+            st.stop()
+
+        not_found = [e for e in eins_deduped if e not in filings[COL_EIN].values]
+        if not_found:
+            st.warning(f"{len(not_found)} EIN(s) not found in index: {', '.join(not_found)}")
+
+        # Parse XML files
+        all_rows = []
         progress = st.progress(0, text="Starting…")
         status = st.empty()
+        total = len(filings)
 
-        for i, ein in enumerate(eins_deduped):
-            status.text(f"Fetching EIN {ein} ({i + 1}/{len(eins_deduped)})…")
-            raw_results[ein] = fetch_org(ein)
-            progress.progress((i + 1) / len(eins_deduped), text=f"{i + 1}/{len(eins_deduped)} fetched")
-            if i < len(eins_deduped) - 1:
-                time.sleep(0.5)
+        for i, (_, idx_row) in enumerate(filings.iterrows()):
+            ein = idx_row[COL_EIN]
+            batch = idx_row[COL_BATCH_ID]
+            obj_id = idx_row[COL_OBJECT_ID]
+            fpath = xml_path(xml_root, batch, obj_id)
+
+            status.text(f"Parsing {os.path.basename(fpath)} ({i + 1}/{total})…")
+
+            if not os.path.isfile(fpath):
+                errors.append({"EIN": ein, "File": fpath, "Error": "File not found"})
+                all_rows.append({"ReturnHeader.Filer.EIN": ein, "_source_file": fpath,
+                                 "_parse_error": "File not found"})
+            else:
+                rows = parse_xml_file(fpath)
+                for r in rows:
+                    # Attach index metadata that may not be in the XML
+                    r.setdefault("ReturnHeader.Filer.EIN", ein)
+                    # Carry through any extra index columns (TAX_PERIOD, RETURN_TYPE, etc.)
+                    for col in index_df.columns:
+                        if col not in {COL_EIN, COL_OBJECT_ID, COL_BATCH_ID}:
+                            r.setdefault(f"_index.{col}", idx_row[col])
+                all_rows.extend(rows)
+
+            progress.progress((i + 1) / total, text=f"{i + 1}/{total} files processed")
 
         status.empty()
         progress.empty()
 
-        st.session_state.raw_results = raw_results
-        st.session_state.all_keys = collect_all_keys(raw_results)
+        df = pd.DataFrame(all_rows)
+        all_cols = ordered_columns(list(df.columns))
+        df = df[all_cols]
 
-        errors = {ein: r["error"] for ein, r in raw_results.items() if r["error"]}
-        st.success(f"{len(raw_results) - len(errors)} fetched successfully, {len(errors)} error(s).")
+        st.session_state.parsed_df = df
+        st.session_state.all_columns = all_cols
+
+        success = total - len(errors)
+        st.success(f"{success}/{total} files parsed successfully, {len(errors)} error(s).")
         if errors:
-            with st.expander(f"⚠️ {len(errors)} EIN(s) with errors"):
-                st.dataframe(
-                    pd.DataFrame([{"EIN": k, "Error": v} for k, v in errors.items()]),
-                    use_container_width=True,
-                )
+            with st.expander(f"⚠️ {len(errors)} file error(s)"):
+                st.dataframe(pd.DataFrame(errors), use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# Step 3: Field selection — only shown after a successful fetch
+# Step 3: Field selection
 # ---------------------------------------------------------------------------
-if st.session_state.all_keys:
+if st.session_state.all_columns:
+    df_full = st.session_state.parsed_df
+    all_cols = st.session_state.all_columns
+
+    # Separate internal cols (_source_file, _parse_error, _index.*) from data cols
+    internal_cols = [c for c in all_cols if c.startswith("_")]
+    data_cols = [c for c in all_cols if not c.startswith("_")]
+
     st.header("Step 3 — Select Fields")
     st.write(
-        f"{len(st.session_state.all_keys)} fields found across your EINs. "
+        f"{len(data_cols)} fields found across all parsed files. "
         "Uncheck anything you don't need in the export."
     )
 
-    all_keys = st.session_state.all_keys
-    mid = (len(all_keys) + 1) // 2
+    # Two-column checkbox layout
+    mid = (len(data_cols) + 1) // 2
     col1, col2 = st.columns(2)
-    selected_keys = []
+    selected_cols = []
 
-    for i, key in enumerate(all_keys):
-        col = col1 if i < mid else col2
-        checked = col.checkbox(
-            label_for(key),
-            value=(key in DEFAULT_CHECKED_KEYS),
-            key=f"field_{key}",
+    for i, col in enumerate(data_cols):
+        target = col1 if i < mid else col2
+        checked = target.checkbox(
+            label_for(col),
+            value=(col in DEFAULT_CHECKED),
+            key=f"col_{col}",
         )
         if checked:
-            selected_keys.append(key)
+            selected_cols.append(col)
+
+    # Always append _parse_error if any errors occurred, so they're visible in export
+    if "_parse_error" in internal_cols and df_full["_parse_error"].notna().any():
+        selected_cols.append("_parse_error")
 
     # ---------------------------------------------------------------------------
     # Step 4: Preview + download
     # ---------------------------------------------------------------------------
     st.header("Step 4 — Export")
 
-    if not selected_keys:
+    if not selected_cols:
         st.warning("Select at least one field above.")
     else:
-        rows = []
-        for ein, result in st.session_state.raw_results.items():
-            flat = flatten_result(result)
-            row = {label_for(k): flat.get(k, "") for k in selected_keys}
-            row["Fetch Error"] = flat.get("_error") or ""
-            rows.append(row)
+        df_export = df_full[[c for c in selected_cols if c in df_full.columns]].copy()
 
-        df = pd.DataFrame(rows)
-
-        # Move Fetch Error to end; drop it entirely if no errors
-        err_col = df.pop("Fetch Error")
-        if err_col.ne("").any():
-            df["Fetch Error"] = err_col
+        # Rename columns to human-readable labels for the export
+        df_export.rename(columns={c: label_for(c) for c in df_export.columns}, inplace=True)
 
         st.subheader("Preview")
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df_export, use_container_width=True)
 
         excel_buf = io.BytesIO()
         with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="990 Data")
+            df_export.to_excel(writer, index=False, sheet_name="990 Data")
         excel_buf.seek(0)
 
-        dl_col1, dl_col2 = st.columns(2)
-        dl_col1.download_button(
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
             label="Download as Excel (.xlsx)",
             data=excel_buf,
             file_name="990_foundation_data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        dl_col2.download_button(
+        dl2.download_button(
             label="Download as CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
+            data=df_export.to_csv(index=False).encode("utf-8"),
             file_name="990_foundation_data.csv",
             mime="text/csv",
         )
