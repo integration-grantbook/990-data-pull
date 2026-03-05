@@ -1,22 +1,20 @@
 """
-990 Foundation Explorer — Local XML Edition
---------------------------------------------
-Reads IRS 990/990PF XML files from a local folder structure, matched by EIN
-via an index CSV, and exports a filtered spreadsheet.
+990 Foundation Explorer
+-----------------------
+Reads IRS 990/990PF XML files from uploaded ZIP archives, matched by EIN
+via an uploaded index CSV, and exports a filtered spreadsheet.
 
 Expected inputs:
-  - XML root folder: directory containing subfolders named by XML_BATCH_ID,
-                     each containing files named {OBJECT_ID}_public.xml
-  - Index CSV:       must contain columns EIN, OBJECT_ID (clean integer), XML_BATCH_ID
-                     Additional columns (TAX_PERIOD, RETURN_TYPE, etc.) are used
-                     for metadata but are not required.
-  - EIN list:        one EIN per line, dashes optional
+  - One or more ZIP files containing {OBJECT_ID}_public.xml files (flat structure,
+    as downloaded from ProPublica / IRS bulk data)
+  - Index CSV with columns: EIN, OBJECT_ID (clean integer), XML_BATCH_ID
+  - List of EINs to extract
 
 Flow:
-  Step 1 – Provide paths + EINs
-  Step 2 – Parse matched XML files; all fields unioned across all files
+  Step 1 – Upload ZIPs + index CSV
+  Step 2 – Paste EINs + parse matched XML files
   Step 3 – Uncheck fields to exclude
-  Step 4 – Preview + download (one row per filing, all filings per EIN)
+  Step 4 – Preview + download
 
 XML parsing strategy:
   - Namespace-agnostic: strips {namespace} prefixes from all tags
@@ -29,10 +27,12 @@ XML parsing strategy:
 
 import io
 import json
-import os
 import re
-import xml.etree.ElementTree as ET
+import tempfile
+import os
+import zipfile
 from collections import defaultdict
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import streamlit as st
@@ -41,44 +41,37 @@ import streamlit as st
 # Constants
 # ---------------------------------------------------------------------------
 
-# Index CSV column names — adjust here if your CSV uses different names
 COL_EIN = "EIN"
 COL_OBJECT_ID = "OBJECT_ID"
 COL_BATCH_ID = "XML_BATCH_ID"
 
-# XML elements to parse as the primary return body.
-# Any tag not in this list that appears under ReturnData is also captured.
-PRIMARY_RETURN_ELEMENTS = {"IRS990", "IRS990PF", "IRS990EZ", "IRS990T"}
-
-# Tags to skip entirely (binary/boilerplate, not useful as data fields)
-SKIP_TAGS = {"BuildTS", "softwareId", "softwareVersionNum", "returnVersion",
-             "documentCnt", "binaryAttachmentCnt", "xsi:schemaLocation"}
-
-# Human-readable labels for common fields. Raw tag names are used for anything
-# not listed here — they're already fairly readable (CamelCase IRS tag names).
-FIELD_LABELS = {
-    "ReturnHeader.ReturnTs":                        "Filing Timestamp",
-    "ReturnHeader.TaxPeriodEndDt":                  "Tax Period End",
-    "ReturnHeader.TaxPeriodBeginDt":                "Tax Period Begin",
-    "ReturnHeader.TaxYr":                           "Tax Year",
-    "ReturnHeader.ReturnTypeCd":                    "Return Type",
-    "ReturnHeader.Filer.EIN":                       "EIN",
-    "ReturnHeader.Filer.BusinessName.BusinessNameLine1Txt": "Organization Name",
-    "ReturnHeader.Filer.BusinessName.BusinessNameLine2Txt": "Organization Name (Line 2)",
-    "ReturnHeader.Filer.PhoneNum":                  "Phone",
-    "ReturnHeader.Filer.USAddress.AddressLine1Txt": "Address",
-    "ReturnHeader.Filer.USAddress.CityNm":          "City",
-    "ReturnHeader.Filer.USAddress.StateAbbreviationCd": "State",
-    "ReturnHeader.Filer.USAddress.ZIPCd":           "ZIP",
-    "ReturnHeader.BusinessOfficerGrp.PersonNm":     "Signing Officer Name",
-    "ReturnHeader.BusinessOfficerGrp.PersonTitleTxt": "Signing Officer Title",
-    "ReturnHeader.BusinessOfficerGrp.PhoneNum":     "Signing Officer Phone",
-    "ReturnHeader.PreparerFirmGrp.PreparerFirmName.BusinessNameLine1Txt": "Preparer Firm",
-    "ReturnHeader.PreparerPersonGrp.PreparerPersonNm": "Preparer Name",
-    "ReturnHeader.PreparerPersonGrp.PhoneNum":      "Preparer Phone",
+SKIP_TAGS = {
+    "BuildTS", "softwareId", "softwareVersionNum", "returnVersion",
+    "documentCnt", "binaryAttachmentCnt", "xsi:schemaLocation",
 }
 
-# Fields checked by default in Step 3
+FIELD_LABELS = {
+    "ReturnHeader.ReturnTs":                                                "Filing Timestamp",
+    "ReturnHeader.TaxPeriodEndDt":                                          "Tax Period End",
+    "ReturnHeader.TaxPeriodBeginDt":                                        "Tax Period Begin",
+    "ReturnHeader.TaxYr":                                                   "Tax Year",
+    "ReturnHeader.ReturnTypeCd":                                            "Return Type",
+    "ReturnHeader.Filer.EIN":                                               "EIN",
+    "ReturnHeader.Filer.BusinessName.BusinessNameLine1Txt":                 "Organization Name",
+    "ReturnHeader.Filer.BusinessName.BusinessNameLine2Txt":                 "Organization Name (Line 2)",
+    "ReturnHeader.Filer.PhoneNum":                                          "Phone",
+    "ReturnHeader.Filer.USAddress.AddressLine1Txt":                         "Address",
+    "ReturnHeader.Filer.USAddress.CityNm":                                  "City",
+    "ReturnHeader.Filer.USAddress.StateAbbreviationCd":                     "State",
+    "ReturnHeader.Filer.USAddress.ZIPCd":                                   "ZIP",
+    "ReturnHeader.BusinessOfficerGrp.PersonNm":                             "Signing Officer Name",
+    "ReturnHeader.BusinessOfficerGrp.PersonTitleTxt":                       "Signing Officer Title",
+    "ReturnHeader.BusinessOfficerGrp.PhoneNum":                             "Signing Officer Phone",
+    "ReturnHeader.PreparerFirmGrp.PreparerFirmName.BusinessNameLine1Txt":   "Preparer Firm",
+    "ReturnHeader.PreparerPersonGrp.PreparerPersonNm":                      "Preparer Name",
+    "ReturnHeader.PreparerPersonGrp.PhoneNum":                              "Preparer Phone",
+}
+
 DEFAULT_CHECKED = {
     "ReturnHeader.TaxYr",
     "ReturnHeader.ReturnTypeCd",
@@ -100,25 +93,13 @@ DEFAULT_CHECKED = {
 # ---------------------------------------------------------------------------
 
 def strip_ns(tag: str) -> str:
-    """Remove XML namespace prefix from a tag: '{http://...}TagName' -> 'TagName'."""
     return re.sub(r"^\{[^}]+\}", "", tag)
 
 
-def flatten_element(el: ET.Element, prefix: str = "") -> tuple[dict, dict]:
-    """
-    Recursively flatten an XML element into a dict of dot-notation key -> value.
-    Returns:
-      scalar_fields  – {key: value} for leaf text nodes
-      repeated_fields – {key: [list of dicts]} for elements that appear >1 time
-                        under the same parent (e.g. officer groups)
-
-    Repeated elements are detected at parse time and stored separately so the
-    caller can decide how to serialise them.
-    """
+def flatten_element(el: ET.Element, prefix: str = "") -> tuple:
     scalar_fields = {}
     repeated_fields = {}
 
-    # Count child tag occurrences to detect repeating groups
     child_tag_counts = defaultdict(int)
     for child in el:
         child_tag_counts[strip_ns(child.tag)] += 1
@@ -131,7 +112,6 @@ def flatten_element(el: ET.Element, prefix: str = "") -> tuple[dict, dict]:
         children = list(child)
 
         if child_tag_counts[tag] > 1:
-            # Repeating group — collect all siblings under parent key
             if key not in repeated_fields:
                 repeated_fields[key] = []
             if children:
@@ -149,39 +129,22 @@ def flatten_element(el: ET.Element, prefix: str = "") -> tuple[dict, dict]:
     return scalar_fields, repeated_fields
 
 
-def parse_xml_file(path: str) -> list[dict]:
-    """
-    Parse one XML file and return a list of row dicts (usually just one row,
-    but structured to allow for extension).
-
-    Merges ReturnHeader fields with the primary return body (IRS990, IRS990PF, etc.).
-    Repeating groups are JSON-serialised into a single column per group.
-    Prefixes header fields with 'ReturnHeader.' and body fields with the element
-    name (e.g. 'IRS990PF.') for unambiguous column naming.
-    """
+def parse_xml_bytes(data: bytes, filename: str) -> list:
     try:
-        tree = ET.parse(path)
+        root = ET.fromstring(data)
     except ET.ParseError as e:
-        return [{"_parse_error": str(e), "_source_file": path}]
+        return [{"_parse_error": str(e), "_source_file": filename}]
 
-    root = tree.getroot()
-    row = {"_source_file": path}
+    row = {"_source_file": filename}
     repeated = {}
 
-    # --- ReturnHeader ---
-    header_el = None
     for child in root:
         if strip_ns(child.tag) == "ReturnHeader":
-            header_el = child
+            scalars, reps = flatten_element(child, prefix="ReturnHeader")
+            row.update(scalars)
+            repeated.update(reps)
             break
 
-    if header_el is not None:
-        scalars, reps = flatten_element(header_el, prefix="ReturnHeader")
-        row.update(scalars)
-        repeated.update({f"ReturnHeader.{k}" if not k.startswith("ReturnHeader") else k: v
-                         for k, v in reps.items()})
-
-    # --- ReturnData: primary body element ---
     for child in root:
         if strip_ns(child.tag) != "ReturnData":
             continue
@@ -190,9 +153,8 @@ def parse_xml_file(path: str) -> list[dict]:
             scalars, reps = flatten_element(body_el, prefix=tag)
             row.update(scalars)
             repeated.update(reps)
-        break  # only one ReturnData expected
+        break
 
-    # Serialise repeated groups as JSON strings
     for key, items in repeated.items():
         row[key] = json.dumps(items, ensure_ascii=False)
 
@@ -200,45 +162,17 @@ def parse_xml_file(path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Index + file resolution
+# Index helpers
 # ---------------------------------------------------------------------------
 
-def load_index(csv_path: str) -> pd.DataFrame:
-    """Load and normalise the index CSV."""
-    df = pd.read_csv(csv_path, dtype={COL_OBJECT_ID: str, COL_EIN: str})
+def load_index(uploaded_file) -> pd.DataFrame:
+    df = pd.read_csv(uploaded_file, dtype={COL_OBJECT_ID: str, COL_EIN: str})
     df[COL_EIN] = df[COL_EIN].str.strip().str.replace(r"\D", "", regex=True)
     df[COL_OBJECT_ID] = df[COL_OBJECT_ID].str.strip()
-    df[COL_BATCH_ID] = df[COL_BATCH_ID].str.strip()
     return df
 
 
-def resolve_filings(index_df: pd.DataFrame, eins: list[str]) -> pd.DataFrame:
-    """
-    Return all index rows matching the supplied EINs.
-    """
-    matched = index_df[index_df[COL_EIN].isin(set(eins))].copy()
-    return matched
-
-
-def xml_path(root_folder: str, batch_id: str, object_id: str) -> str:
-    return os.path.join(root_folder, batch_id, f"{object_id}_public.xml")
-
-
-# ---------------------------------------------------------------------------
-# Field ordering helpers
-# ---------------------------------------------------------------------------
-
-def ordered_columns(all_columns: list[str]) -> list[str]:
-    """
-    Return columns in a logical order:
-      1. ReturnHeader fields (identity + contact first)
-      2. IRS990PF fields
-      3. IRS990 fields
-      4. IRS990EZ fields
-      5. IRS990T fields
-      6. Everything else
-      7. Internal fields (_source_file, _parse_error) last
-    """
+def ordered_columns(cols: list) -> list:
     def sort_key(col):
         if col.startswith("_"):
             return (99, col)
@@ -255,12 +189,44 @@ def ordered_columns(all_columns: list[str]) -> list[str]:
         if col.startswith("IRS990T"):
             return (5, col)
         return (6, col)
-
-    return sorted(all_columns, key=sort_key)
+    return sorted(cols, key=sort_key)
 
 
 def label_for(key: str) -> str:
     return FIELD_LABELS.get(key, key)
+
+
+# ---------------------------------------------------------------------------
+# ZIP extraction into temp dir
+# ---------------------------------------------------------------------------
+
+def extract_zips_to_tempdir(uploaded_zips) -> tuple:
+    """
+    Extract all uploaded ZIP files into a shared temp directory.
+    Returns (temp_dir_path, {object_id: full_file_path}, list_of_errors)
+    """
+    tmp = tempfile.mkdtemp()
+    file_map = {}   # object_id (without _public.xml) -> full path
+    errors = []
+
+    for uploaded_zip in uploaded_zips:
+        try:
+            with zipfile.ZipFile(io.BytesIO(uploaded_zip.read())) as zf:
+                for name in zf.namelist():
+                    if not name.endswith("_public.xml"):
+                        continue
+                    basename = os.path.basename(name)
+                    obj_id = basename.replace("_public.xml", "")
+                    dest = os.path.join(tmp, basename)
+                    with zf.open(name) as src, open(dest, "wb") as dst:
+                        dst.write(src.read())
+                    file_map[obj_id] = dest
+        except zipfile.BadZipFile:
+            errors.append(f"{uploaded_zip.name}: not a valid ZIP file")
+        except Exception as e:
+            errors.append(f"{uploaded_zip.name}: {e}")
+
+    return tmp, file_map, errors
 
 
 # ---------------------------------------------------------------------------
@@ -269,41 +235,70 @@ def label_for(key: str) -> str:
 
 st.set_page_config(page_title="990 Foundation Explorer", layout="wide")
 st.title("990 Foundation Explorer")
-st.caption("Parses local IRS 990/990PF XML files matched via an index CSV.")
+st.caption(
+    "Upload IRS 990/990PF ZIP archives and an index CSV to extract structured "
+    "data for a list of EINs."
+)
 
 if "parsed_df" not in st.session_state:
     st.session_state.parsed_df = None
 if "all_columns" not in st.session_state:
     st.session_state.all_columns = []
+if "file_map" not in st.session_state:
+    st.session_state.file_map = {}
 
 # ---------------------------------------------------------------------------
-# Step 1: Inputs
+# Step 1: Uploads
 # ---------------------------------------------------------------------------
-st.header("Step 1 — Inputs")
+st.header("Step 1 — Upload Files")
 
 col_a, col_b = st.columns(2)
 
 with col_a:
-    xml_root = st.text_input(
-        "XML root folder path",
-        placeholder="/Users/you/irs_990_xmls",
-        help="Folder containing subfolders named by XML_BATCH_ID (e.g. 2025_TEOS_XML_12A/)",
-    )
-    index_path = st.text_input(
-        "Index CSV path",
-        placeholder="/Users/you/index_2025.csv",
-        help="Must contain columns: EIN, OBJECT_ID (clean integer), XML_BATCH_ID",
+    uploaded_zips = st.file_uploader(
+        "990 XML ZIP archive(s)",
+        type="zip",
+        accept_multiple_files=True,
+        help="One or more ZIP files as downloaded from ProPublica / IRS bulk data. "
+             "Each ZIP should contain {OBJECT_ID}_public.xml files in a flat structure.",
     )
 
 with col_b:
-    ein_input = st.text_area(
-        "EINs (one per line, dashes optional)",
-        height=200,
-        placeholder="237125454\n330759830\n933607439",
+    uploaded_index = st.file_uploader(
+        "Index CSV",
+        type="csv",
+        help="Must contain columns: EIN, OBJECT_ID (clean integer), XML_BATCH_ID",
     )
 
-eins_raw = [line.strip() for line in ein_input.splitlines() if line.strip()]
-eins_cleaned = [re.sub(r"\D", "", e) for e in eins_raw if re.sub(r"\D", "", e)]
+# Extract ZIPs when uploaded (cached in session state by file identity)
+zip_names_key = tuple(sorted(f.name for f in uploaded_zips)) if uploaded_zips else ()
+if uploaded_zips and zip_names_key != st.session_state.get("_zip_names_key"):
+    with st.spinner(f"Extracting {len(uploaded_zips)} ZIP file(s)…"):
+        _, file_map, zip_errors = extract_zips_to_tempdir(uploaded_zips)
+    st.session_state.file_map = file_map
+    st.session_state["_zip_names_key"] = zip_names_key
+    if zip_errors:
+        for e in zip_errors:
+            st.error(e)
+    else:
+        st.success(f"{len(file_map):,} XML files extracted across {len(uploaded_zips)} ZIP(s).")
+
+if st.session_state.file_map:
+    st.caption(f"{len(st.session_state.file_map):,} XML files available.")
+
+# ---------------------------------------------------------------------------
+# Step 2: EINs + parse
+# ---------------------------------------------------------------------------
+st.header("Step 2 — Paste EINs & Parse")
+
+ein_input = st.text_area(
+    "EINs (one per line, dashes optional)",
+    height=180,
+    placeholder="237125454\n330759830\n933607439",
+)
+
+eins_cleaned = [re.sub(r"\D", "", e.strip()) for e in ein_input.splitlines() if e.strip()]
+eins_cleaned = [e for e in eins_cleaned if e]
 
 seen = set()
 eins_deduped = []
@@ -317,68 +312,74 @@ if eins_deduped:
     if len(eins_cleaned) != len(eins_deduped):
         st.warning(f"{len(eins_cleaned) - len(eins_deduped)} duplicate(s) removed.")
 
-# ---------------------------------------------------------------------------
-# Step 2: Parse
-# ---------------------------------------------------------------------------
-st.header("Step 2 — Parse XML Files")
-
-inputs_ready = xml_root and index_path and eins_deduped
+inputs_ready = (
+    bool(st.session_state.file_map)
+    and uploaded_index is not None
+    and bool(eins_deduped)
+)
 
 if not inputs_ready:
-    st.info("Complete all inputs above to continue.")
+    missing = []
+    if not st.session_state.file_map:
+        missing.append("ZIP file(s)")
+    if uploaded_index is None:
+        missing.append("index CSV")
+    if not eins_deduped:
+        missing.append("EINs")
+    st.info(f"Still needed: {', '.join(missing)}.")
 else:
     if st.button("Parse Files", type="primary"):
-        errors = []
-
         # Load index
-        if not os.path.isfile(index_path):
-            st.error(f"Index CSV not found: {index_path}")
-            st.stop()
-        if not os.path.isdir(xml_root):
-            st.error(f"XML root folder not found: {xml_root}")
+        try:
+            index_df = load_index(uploaded_index)
+        except Exception as e:
+            st.error(f"Failed to load index CSV: {e}")
             st.stop()
 
-        with st.spinner("Loading index CSV…"):
-            try:
-                index_df = load_index(index_path)
-            except Exception as e:
-                st.error(f"Failed to load index CSV: {e}")
-                st.stop()
-
-        filings = resolve_filings(index_df, eins_deduped)
+        # Match EINs to index rows
+        filings = index_df[index_df[COL_EIN].isin(set(eins_deduped))].copy()
 
         if filings.empty:
             st.error("None of the supplied EINs were found in the index CSV.")
             st.stop()
 
-        not_found = [e for e in eins_deduped if e not in filings[COL_EIN].values]
-        if not_found:
-            st.warning(f"{len(not_found)} EIN(s) not found in index: {', '.join(not_found)}")
+        not_found_in_index = [e for e in eins_deduped if e not in filings[COL_EIN].values]
+        if not_found_in_index:
+            st.warning(
+                f"{len(not_found_in_index)} EIN(s) not found in index: "
+                f"{', '.join(not_found_in_index)}"
+            )
 
-        # Parse XML files
+        # Parse matched XML files
         all_rows = []
+        file_errors = []
+        file_map = st.session_state.file_map
+
         progress = st.progress(0, text="Starting…")
         status = st.empty()
         total = len(filings)
 
         for i, (_, idx_row) in enumerate(filings.iterrows()):
             ein = idx_row[COL_EIN]
-            batch = idx_row[COL_BATCH_ID]
-            obj_id = idx_row[COL_OBJECT_ID]
-            fpath = xml_path(xml_root, batch, obj_id)
+            obj_id = str(idx_row[COL_OBJECT_ID]).strip()
+            filename = f"{obj_id}_public.xml"
 
-            status.text(f"Parsing {os.path.basename(fpath)} ({i + 1}/{total})…")
+            status.text(f"Parsing {filename} ({i + 1}/{total})…")
 
-            if not os.path.isfile(fpath):
-                errors.append({"EIN": ein, "File": fpath, "Error": "File not found"})
-                all_rows.append({"ReturnHeader.Filer.EIN": ein, "_source_file": fpath,
-                                 "_parse_error": "File not found"})
+            if obj_id not in file_map:
+                file_errors.append({"EIN": ein, "File": filename, "Error": "Not found in uploaded ZIPs"})
+                all_rows.append({
+                    "ReturnHeader.Filer.EIN": ein,
+                    "_source_file": filename,
+                    "_parse_error": "File not found in uploaded ZIPs",
+                })
             else:
-                rows = parse_xml_file(fpath)
+                with open(file_map[obj_id], "rb") as f:
+                    data = f.read()
+                rows = parse_xml_bytes(data, filename)
                 for r in rows:
-                    # Attach index metadata that may not be in the XML
                     r.setdefault("ReturnHeader.Filer.EIN", ein)
-                    # Carry through any extra index columns (TAX_PERIOD, RETURN_TYPE, etc.)
+                    # Carry through extra index columns as metadata
                     for col in index_df.columns:
                         if col not in {COL_EIN, COL_OBJECT_ID, COL_BATCH_ID}:
                             r.setdefault(f"_index.{col}", idx_row[col])
@@ -396,11 +397,11 @@ else:
         st.session_state.parsed_df = df
         st.session_state.all_columns = all_cols
 
-        success = total - len(errors)
-        st.success(f"{success}/{total} files parsed successfully, {len(errors)} error(s).")
-        if errors:
-            with st.expander(f"⚠️ {len(errors)} file error(s)"):
-                st.dataframe(pd.DataFrame(errors), use_container_width=True)
+        success = total - len(file_errors)
+        st.success(f"{success}/{total} files parsed successfully, {len(file_errors)} error(s).")
+        if file_errors:
+            with st.expander(f"⚠️ {len(file_errors)} file error(s)"):
+                st.dataframe(pd.DataFrame(file_errors), use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Step 3: Field selection
@@ -409,7 +410,6 @@ if st.session_state.all_columns:
     df_full = st.session_state.parsed_df
     all_cols = st.session_state.all_columns
 
-    # Separate internal cols (_source_file, _parse_error, _index.*) from data cols
     internal_cols = [c for c in all_cols if c.startswith("_")]
     data_cols = [c for c in all_cols if not c.startswith("_")]
 
@@ -419,7 +419,6 @@ if st.session_state.all_columns:
         "Uncheck anything you don't need in the export."
     )
 
-    # Two-column checkbox layout
     mid = (len(data_cols) + 1) // 2
     col1, col2 = st.columns(2)
     selected_cols = []
@@ -434,7 +433,6 @@ if st.session_state.all_columns:
         if checked:
             selected_cols.append(col)
 
-    # Always append _parse_error if any errors occurred, so they're visible in export
     if "_parse_error" in internal_cols and df_full["_parse_error"].notna().any():
         selected_cols.append("_parse_error")
 
@@ -447,8 +445,6 @@ if st.session_state.all_columns:
         st.warning("Select at least one field above.")
     else:
         df_export = df_full[[c for c in selected_cols if c in df_full.columns]].copy()
-
-        # Rename columns to human-readable labels for the export
         df_export.rename(columns={c: label_for(c) for c in df_export.columns}, inplace=True)
 
         st.subheader("Preview")
