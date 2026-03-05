@@ -16,12 +16,16 @@ Response shape:
 This app uses the most recent filing row from filings_with_data for financials,
 combined with the organization-level fields, to build one row per EIN.
 
+Flow:
+  Step 1 – Paste EINs
+  Step 2 – Fetch all EINs; raw data stored in session state
+  Step 3 – Select which fields to keep (derived from actual API response keys)
+  Step 4 – Preview + download
+
 Notes:
 - ProPublica data lags the IRS by roughly 6–12 months.
-- 990-PF fields (e.g. grantmaking) are present only when formtype indicates PF.
-- Fields that don't apply to a given form type will be blank for that org.
-- No API key required; ProPublica rate-limits generously but add a small delay
-  between requests to be respectful of their servers.
+- 990-PF fields are present only when formtype indicates PF; blank otherwise.
+- No API key required; 0.5s delay between requests out of courtesy.
 """
 
 import time
@@ -33,91 +37,133 @@ import pandas as pd
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Field definitions
-# ---------------------------------------------------------------------------
-# Each entry: (column_label, source, api_key)
-#   source = "org"     -> from response["organization"]
-#   source = "filing"  -> from most recent row of response["filings_with_data"]
-#
-# Field names come from the ProPublica API documentation and observed response keys.
-# Some filing fields are only populated for specific form types (noted in comments).
-
-ORG_FIELDS = [
-    ("EIN",                        "org",     "ein"),
-    ("Organization Name",          "org",     "name"),
-    ("Care Of Name",               "org",     "careofname"),
-    ("Address",                    "org",     "address"),
-    ("City",                       "org",     "city"),
-    ("State",                      "org",     "state"),
-    ("ZIP",                        "org",     "zipcode"),
-    ("Phone",                      "org",     "phone"),
-    ("Website",                    "org",     "website"),
-    ("NTEE Code",                  "org",     "ntee_code"),
-    ("Subsection Code",            "org",     "subseccd"),       # e.g. 03 = 501(c)(3)
-    ("Ruling Date",                "org",     "ruling"),
-    ("Classification Codes",       "org",     "classification_codes"),
-    ("Exempt Status Code",         "org",     "exempt_status_code"),
-    ("Asset Amount (BMF)",         "org",     "asset_amount"),   # IRS Business Master File figure
-    ("Income Amount (BMF)",        "org",     "income_amount"),
-    ("Revenue Amount (BMF)",       "org",     "revenue_amount"),
-    ("Filing Requirement Code",    "org",     "filing_requirement_code"),
-    ("PF Filing Requirement Code", "org",     "pf_filing_requirement_code"),
-    ("Accounting Period",          "org",     "accounting_period"),
-]
-
-FILING_FIELDS = [
-    # --- Filing metadata ---
-    ("Most Recent Tax Year",       "filing",  "tax_prd_yr"),
-    ("Form Type",                  "filing",  "formtype_str"),    # "990", "990EZ", "990PF"
-    ("Filing Updated",             "filing",  "updated"),
-
-    # --- Core financials (990 & 990-EZ) ---
-    ("Total Revenue",              "filing",  "totrevenue"),
-    ("Total Functional Expenses",  "filing",  "totfuncexpns"),
-    ("Total Assets (EOY)",         "filing",  "totassetsend"),
-    ("Total Liabilities (EOY)",    "filing",  "totliabend"),
-    ("Net Assets (EOY)",           "filing",  "totnetassetsend"),
-    ("Total Contributions",        "filing",  "totcntrbs"),
-    ("Program Service Revenue",    "filing",  "prgmservrev"),
-    ("Investment Income",          "filing",  "invstmntinc"),
-    ("Other Revenue",              "filing",  "othrevnue"),
-    ("Fundraising Gross Revenue",  "filing",  "grsrevnuefndrsng"),
-    ("Fundraising Direct Expenses","filing",  "direxpns"),
-    ("Net Fundraising Income",     "filing",  "netincfndrsng"),
-    ("Unrelated Business Income",  "filing",  "unrelbusincd"),    # Y/N indicator
-    ("Officer Compensation %",     "filing",  "pct_compnsatncurrofcr"),
-
-    # --- 990-PF specific ---
-    # These fields are present in filings_with_data rows where formtype = PF.
-    # They will be blank for 990/990-EZ filers.
-    ("PF: Gross Investment Income",      "filing", "grsincgaming"),   # NOTE: ProPublica maps PF inv income here; verify on live data
-    ("PF: Total Grants Paid",            "filing", "grsrcptsrelatd170"),  # Approximate; PF uses disbrsements field
-    ("PF: Contributions Received",       "filing", "totgftgrntrcvd509"),
-
-    # --- Public support (990 Part II / Schedule A) ---
-    ("Gifts/Grants Received (170)",      "filing", "gftgrntrcvd170"),
-    ("Gross Public Receipts",            "filing", "grspublicrcpts"),
-    ("Total Support (509)",              "filing", "totsupp509"),
-]
-
-ALL_FIELDS = ORG_FIELDS + FILING_FIELDS
-
-# Fields shown by default (pre-checked). Uncheck to exclude from export.
-DEFAULT_ON = {
-    "EIN", "Organization Name", "Address", "City", "State", "ZIP", "Phone",
-    "Website", "NTEE Code", "Ruling Date",
-    "Most Recent Tax Year", "Form Type",
-    "Total Revenue", "Total Functional Expenses", "Total Assets (EOY)",
-    "Total Liabilities (EOY)", "Net Assets (EOY)", "Total Contributions",
-    "Program Service Revenue",
-}
-
-# ---------------------------------------------------------------------------
-# API helpers
+# Constants
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://projects.propublica.org/nonprofits/api/v2/organizations/{ein}.json"
 
+# Human-readable labels for known API keys.
+# Any key not listed here is displayed as the raw key name.
+KEY_LABELS = {
+    "ein": "EIN",
+    "name": "Organization Name",
+    "careofname": "Care Of Name",
+    "address": "Address",
+    "city": "City",
+    "state": "State",
+    "zipcode": "ZIP",
+    "phone": "Phone",
+    "website": "Website",
+    "ntee_code": "NTEE Code",
+    "subseccd": "Subsection Code",
+    "ruling": "Ruling Date",
+    "classification_codes": "Classification Codes",
+    "exempt_status_code": "Exempt Status Code",
+    "asset_amount": "Asset Amount (BMF)",
+    "income_amount": "Income Amount (BMF)",
+    "revenue_amount": "Revenue Amount (BMF)",
+    "filing_requirement_code": "Filing Requirement Code",
+    "pf_filing_requirement_code": "PF Filing Requirement Code",
+    "accounting_period": "Accounting Period",
+    "tax_prd_yr": "Most Recent Tax Year",
+    "tax_prd": "Tax Period",
+    "formtype_str": "Form Type",
+    "updated": "Filing Updated",
+    "totrevenue": "Total Revenue",
+    "totfuncexpns": "Total Functional Expenses",
+    "totassetsend": "Total Assets (EOY)",
+    "totliabend": "Total Liabilities (EOY)",
+    "totnetassetsend": "Net Assets (EOY)",
+    "totcntrbs": "Total Contributions",
+    "prgmservrev": "Program Service Revenue",
+    "invstmntinc": "Investment Income",
+    "othrevnue": "Other Revenue",
+    "grsrevnuefndrsng": "Fundraising Gross Revenue",
+    "direxpns": "Fundraising Direct Expenses",
+    "netincfndrsng": "Net Fundraising Income",
+    "unrelbusincd": "Unrelated Business Income (Y/N)",
+    "unrelbusinccd": "Unrelated Business Income Code",
+    "pct_compnsatncurrofcr": "Officer Compensation %",
+    "compnsatncurrofcr": "Officer Compensation",
+    "othrsalwages": "Other Salaries & Wages",
+    "payrolltx": "Payroll Tax",
+    "profndraising": "Professional Fundraising",
+    "totexcessyr": "Excess/Deficit for Year",
+    "othrchgsnetassetfnd": "Other Changes in Net Assets",
+    "initiationfee": "Initiation Fees",
+    "grsincgaming": "Gross Gaming Income",
+    "gftgrntrcvd170": "Gifts/Grants Received (170)",
+    "gftgrntsrcvd170": "Gifts/Grants Received (170b)",
+    "grspublicrcpts": "Gross Public Receipts",
+    "totsupp509": "Total Support (509)",
+    "totgftgrntrcvd509": "Total Gifts/Grants (509)",
+    "grsrcptsrelatd170": "Gross Receipts Related (170)",
+    "grsrcptsrelated170": "Gross Receipts Related (170b)",
+    "grsrcptsadmiss509": "Gross Receipts Admissions (509)",
+    "grsrcptsadmissn509": "Gross Receipts Admissions (509b)",
+    "nonpfrea": "Non-PF Reason Code",
+    "txrevnuelevied170": "Tax Revenue Levied (170)",
+    "txrevnuelevied509": "Tax Revenue Levied (509)",
+    "srvcsval170": "Services Value (170)",
+    "srvcsval509": "Services Value (509)",
+    "grsinc170": "Gross Income (170)",
+    "grsincmembers": "Gross Income from Members",
+    "grsincother": "Gross Income Other",
+    "totcntrbgfts": "Total Contributions & Gifts",
+    "totprgmrevnue": "Total Program Revenue",
+    "txexmptbndsproceeds": "Tax-Exempt Bond Proceeds",
+    "txexmptbndsend": "Tax-Exempt Bonds (EOY)",
+    "royaltsinc": "Royalties Income",
+    "grsrntsreal": "Gross Rents (Real)",
+    "grsrntsprsnl": "Gross Rents (Personal)",
+    "rntlexpnsreal": "Rental Expenses (Real)",
+    "rntlexpnsprsnl": "Rental Expenses (Personal)",
+    "rntlincreal": "Rental Income (Real)",
+    "rntlincprsnl": "Rental Income (Personal)",
+    "netrntlinc": "Net Rental Income",
+    "grsalesecur": "Gross Sales (Securities)",
+    "grsalesothr": "Gross Sales (Other)",
+    "cstbasisecur": "Cost Basis (Securities)",
+    "cstbasisothr": "Cost Basis (Other)",
+    "gnlsecur": "Gain/Loss (Securities)",
+    "gnlsothr": "Gain/Loss (Other)",
+    "netgnls": "Net Gains/Losses",
+    "grsincfndrsng": "Gross Fundraising Income",
+    "lessdirfndrsng": "Less Direct Fundraising",
+    "lessdirgaming": "Less Direct Gaming",
+    "netincgaming": "Net Gaming Income",
+    "grsalesinvent": "Gross Sales (Inventory)",
+    "lesscstofgoods": "Less Cost of Goods",
+    "netincsales": "Net Income from Sales",
+    "miscrevtot11e": "Miscellaneous Revenue",
+    "secrdmrtgsend": "Secured Mortgages (EOY)",
+    "unsecurednotesend": "Unsecured Notes (EOY)",
+    "retainedearnend": "Retained Earnings (EOY)",
+    "totnetassetend": "Total Net Assets (EOY)",
+    "grsalesminusret": "Gross Sales Minus Returns",
+    "costgoodsold": "Cost of Goods Sold",
+    "grsprft": "Gross Profit",
+    "duesassesmnts": "Dues & Assessments",
+    "othrinvstinc": "Other Investment Income",
+    "grsamtsalesastothr": "Gross Amount Sales (Other Assets)",
+    "basisalesexpnsothr": "Basis/Sales Expenses (Other)",
+    "gnsaleofastothr": "Gain on Sale (Other Assets)",
+    "subtotsuppinc509": "Subtotal Support Income (509)",
+    "totgftgrntrcvd170": "Total Gifts/Grants (170)",
+}
+
+# Keys checked by default in Step 3
+DEFAULT_CHECKED_KEYS = {
+    "ein", "name", "address", "city", "state", "zipcode", "phone", "website",
+    "ntee_code", "ruling",
+    "tax_prd_yr", "formtype_str",
+    "totrevenue", "totfuncexpns", "totassetsend", "totliabend", "totnetassetsend",
+    "totcntrbs", "prgmservrev",
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def clean_ein(raw: str) -> str:
     """Strip non-digits from an EIN string."""
@@ -126,9 +172,8 @@ def clean_ein(raw: str) -> str:
 
 def fetch_org(ein: str) -> dict:
     """
-    Call the ProPublica API for a single EIN.
-    Returns a dict with keys: 'organization', 'filings_with_data', 'error'
-    'error' is None on success, a string message on failure.
+    Call the ProPublica API for one EIN.
+    Returns: {'organization': dict, 'filings_with_data': list, 'error': str|None}
     """
     url = BASE_URL.format(ein=ein)
     try:
@@ -148,28 +193,52 @@ def fetch_org(ein: str) -> dict:
         return {"organization": {}, "filings_with_data": [], "error": str(e)}
 
 
-def extract_row(ein: str, result: dict, selected_labels: list) -> dict:
+def flatten_result(result: dict) -> dict:
     """
-    Flatten org + most-recent-filing into a single dict,
-    keeping only the selected field labels.
+    Merge org fields and most-recent filing fields into one flat dict.
+    Org keys overwrite filing keys on collision (org data is more authoritative
+    for shared fields like 'ein').
     """
-    org = result["organization"]
-    filings = result["filings_with_data"]
-
-    # Most recent filing = first row (ProPublica returns descending by tax year)
+    org = result.get("organization", {})
+    filings = result.get("filings_with_data", [])
     filing = filings[0] if filings else {}
 
-    row = {"_fetch_error": result["error"]}
+    flat = {**filing, **org}  # org wins on collision
+    flat["_error"] = result.get("error")
+    return flat
 
-    for label, source, key in ALL_FIELDS:
-        if label not in selected_labels:
+
+def collect_all_keys(raw_results: dict) -> list:
+    """
+    Return an ordered list of all non-internal keys that appear across all results.
+    Org-level keys come first (in first-seen order), then filing-only keys.
+    """
+    org_keys = []
+    filing_keys = []
+    org_keys_set = set()
+    filing_keys_set = set()
+
+    for ein, result in raw_results.items():
+        if result["error"]:
             continue
-        if source == "org":
-            row[label] = org.get(key, "")
-        else:
-            row[label] = filing.get(key, "")
+        org = result.get("organization", {})
+        filings = result.get("filings_with_data", [])
+        filing = filings[0] if filings else {}
 
-    return row
+        for k in org:
+            if k not in org_keys_set:
+                org_keys_set.add(k)
+                org_keys.append(k)
+        for k in filing:
+            if k not in org_keys_set and k not in filing_keys_set:
+                filing_keys_set.add(k)
+                filing_keys.append(k)
+
+    return org_keys + filing_keys
+
+
+def label_for(key: str) -> str:
+    return KEY_LABELS.get(key, key)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +253,11 @@ st.caption(
     "ProPublica's dataset typically lags the IRS by 6–12 months."
 )
 
+if "raw_results" not in st.session_state:
+    st.session_state.raw_results = {}
+if "all_keys" not in st.session_state:
+    st.session_state.all_keys = []
+
 # ---------------------------------------------------------------------------
 # Step 1: EIN input
 # ---------------------------------------------------------------------------
@@ -195,7 +269,6 @@ ein_input = st.text_area("EINs", height=180, placeholder="237125454\n330759830\n
 eins_raw = [line.strip() for line in ein_input.splitlines() if line.strip()]
 eins = [clean_ein(e) for e in eins_raw if clean_ein(e)]
 
-# Deduplicate while preserving order
 seen = set()
 eins_deduped = []
 for e in eins:
@@ -209,118 +282,105 @@ if eins_deduped:
         st.warning(f"{len(eins) - len(eins_deduped)} duplicate(s) removed.")
 
 # ---------------------------------------------------------------------------
-# Step 2: Field selection
+# Step 2: Fetch
 # ---------------------------------------------------------------------------
-st.header("Step 2 — Select Fields")
-st.write("Uncheck any fields you don't need in the export.")
-
-col1, col2 = st.columns(2)
-
-selected_labels = []
-
-with col1:
-    st.subheader("Organization Profile")
-    for label, source, _ in ORG_FIELDS:
-        checked = st.checkbox(label, value=(label in DEFAULT_ON), key=f"field_{label}")
-        if checked:
-            selected_labels.append(label)
-
-with col2:
-    st.subheader("Filing & Financials")
-    for label, source, _ in FILING_FIELDS:
-        checked = st.checkbox(label, value=(label in DEFAULT_ON), key=f"field_{label}")
-        if checked:
-            selected_labels.append(label)
-
-# Preserve the defined column order in the export
-selected_labels_ordered = [lbl for lbl, _, _ in ALL_FIELDS if lbl in selected_labels]
-
-# ---------------------------------------------------------------------------
-# Step 3: Fetch & compile
-# ---------------------------------------------------------------------------
-st.header("Step 3 — Fetch & Export")
+st.header("Step 2 — Fetch Data")
 
 if not eins_deduped:
     st.info("Enter at least one EIN above to continue.")
-elif not selected_labels_ordered:
-    st.warning("Select at least one field above.")
 else:
     if st.button("Fetch Data", type="primary"):
-        rows = []
-        errors = []
-
+        raw_results = {}
         progress = st.progress(0, text="Starting…")
         status = st.empty()
 
         for i, ein in enumerate(eins_deduped):
             status.text(f"Fetching EIN {ein} ({i + 1}/{len(eins_deduped)})…")
-            result = fetch_org(ein)
-
-            if result["error"]:
-                errors.append({"EIN": ein, "Error": result["error"]})
-                # Still add a row with the error and blank fields
-                row = {"EIN": ein, "_fetch_error": result["error"]}
-                for label in selected_labels_ordered:
-                    if label != "EIN":
-                        row[label] = ""
-                rows.append(row)
-            else:
-                row = extract_row(ein, result, selected_labels_ordered)
-                rows.append(row)
-
+            raw_results[ein] = fetch_org(ein)
             progress.progress((i + 1) / len(eins_deduped), text=f"{i + 1}/{len(eins_deduped)} fetched")
-            # Polite delay between API calls
             if i < len(eins_deduped) - 1:
                 time.sleep(0.5)
 
         status.empty()
         progress.empty()
 
-        df = pd.DataFrame(rows)
+        st.session_state.raw_results = raw_results
+        st.session_state.all_keys = collect_all_keys(raw_results)
 
-        # Move _fetch_error to end, rename for readability
-        if "_fetch_error" in df.columns:
-            err_col = df.pop("_fetch_error")
-            df["Fetch Error"] = err_col
-
-        # Keep only selected + error columns
-        export_cols = [c for c in selected_labels_ordered if c in df.columns] + (
-            ["Fetch Error"] if "Fetch Error" in df.columns else []
-        )
-        df_export = df[export_cols]
-
-        st.success(f"Done. {len(eins_deduped) - len(errors)} fetched successfully, {len(errors)} error(s).")
-
+        errors = {ein: r["error"] for ein, r in raw_results.items() if r["error"]}
+        st.success(f"{len(raw_results) - len(errors)} fetched successfully, {len(errors)} error(s).")
         if errors:
             with st.expander(f"⚠️ {len(errors)} EIN(s) with errors"):
-                st.dataframe(pd.DataFrame(errors), use_container_width=True)
+                st.dataframe(
+                    pd.DataFrame([{"EIN": k, "Error": v} for k, v in errors.items()]),
+                    use_container_width=True,
+                )
+
+# ---------------------------------------------------------------------------
+# Step 3: Field selection — only shown after a successful fetch
+# ---------------------------------------------------------------------------
+if st.session_state.all_keys:
+    st.header("Step 3 — Select Fields")
+    st.write(
+        f"{len(st.session_state.all_keys)} fields found across your EINs. "
+        "Uncheck anything you don't need in the export."
+    )
+
+    all_keys = st.session_state.all_keys
+    mid = (len(all_keys) + 1) // 2
+    col1, col2 = st.columns(2)
+    selected_keys = []
+
+    for i, key in enumerate(all_keys):
+        col = col1 if i < mid else col2
+        checked = col.checkbox(
+            label_for(key),
+            value=(key in DEFAULT_CHECKED_KEYS),
+            key=f"field_{key}",
+        )
+        if checked:
+            selected_keys.append(key)
+
+    # ---------------------------------------------------------------------------
+    # Step 4: Preview + download
+    # ---------------------------------------------------------------------------
+    st.header("Step 4 — Export")
+
+    if not selected_keys:
+        st.warning("Select at least one field above.")
+    else:
+        rows = []
+        for ein, result in st.session_state.raw_results.items():
+            flat = flatten_result(result)
+            row = {label_for(k): flat.get(k, "") for k in selected_keys}
+            row["Fetch Error"] = flat.get("_error") or ""
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+
+        # Move Fetch Error to end; drop it entirely if no errors
+        err_col = df.pop("Fetch Error")
+        if err_col.ne("").any():
+            df["Fetch Error"] = err_col
 
         st.subheader("Preview")
-        st.dataframe(df_export, use_container_width=True)
+        st.dataframe(df, use_container_width=True)
 
-        # ---------------------------------------------------------------------------
-        # Step 4: Download
-        # ---------------------------------------------------------------------------
-        st.header("Step 4 — Download")
-
-        # Excel
         excel_buf = io.BytesIO()
         with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-            df_export.to_excel(writer, index=False, sheet_name="990 Data")
+            df.to_excel(writer, index=False, sheet_name="990 Data")
         excel_buf.seek(0)
 
-        st.download_button(
+        dl_col1, dl_col2 = st.columns(2)
+        dl_col1.download_button(
             label="Download as Excel (.xlsx)",
             data=excel_buf,
             file_name="990_foundation_data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
-        # CSV
-        csv_buf = df_export.to_csv(index=False).encode("utf-8")
-        st.download_button(
+        dl_col2.download_button(
             label="Download as CSV",
-            data=csv_buf,
+            data=df.to_csv(index=False).encode("utf-8"),
             file_name="990_foundation_data.csv",
             mime="text/csv",
         )
