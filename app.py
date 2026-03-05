@@ -4,23 +4,20 @@
 Reads IRS 990/990PF XML files from uploaded ZIP archives, matched by EIN
 via an uploaded index CSV, and exports a filtered spreadsheet.
 
-Expected inputs:
-  - One or more ZIP files containing {OBJECT_ID}_public.xml files (flat structure,
-    as downloaded from ProPublica / IRS bulk data)
-  - Index CSV with columns: EIN, OBJECT_ID (clean integer), XML_BATCH_ID
-  - List of EINs to extract
-
 Flow:
-  Step 1 – Upload ZIPs + index CSV
-  Step 2 – Paste EINs + parse matched XML files
-  Step 3 – Uncheck fields to exclude
-  Step 4 – Preview + download
+  Step 1 – Upload index CSV + paste EINs
+            App resolves which XML_BATCH_IDs are needed and tells you exactly
+            which ZIP files to upload.
+  Step 2 – Upload only the required ZIP files
+  Step 3 – Parse; app extracts and parses only the matched XML files
+  Step 4 – Uncheck fields to exclude
+  Step 5 – Preview + download
 
 XML parsing strategy:
   - Namespace-agnostic: strips {namespace} prefixes from all tags
   - Flattens nested elements with dot-notation keys (e.g. Filer.USAddress.CityNm)
   - Repeating groups (e.g. multiple officers) are serialised as JSON strings
-    in a single cell — one column per repeating group type
+    in a single cell
   - Fields from ReturnHeader and the primary IRS990/IRS990PF element are merged
     into one row per filing
 """
@@ -28,8 +25,8 @@ XML parsing strategy:
 import io
 import json
 import re
-import tempfile
 import os
+import tempfile
 import zipfile
 from collections import defaultdict
 import xml.etree.ElementTree as ET
@@ -169,6 +166,7 @@ def load_index(uploaded_file) -> pd.DataFrame:
     df = pd.read_csv(uploaded_file, dtype={COL_OBJECT_ID: str, COL_EIN: str})
     df[COL_EIN] = df[COL_EIN].str.strip().str.replace(r"\D", "", regex=True)
     df[COL_OBJECT_ID] = df[COL_OBJECT_ID].str.strip()
+    df[COL_BATCH_ID] = df[COL_BATCH_ID].str.strip()
     return df
 
 
@@ -197,16 +195,17 @@ def label_for(key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ZIP extraction into temp dir
+# ZIP extraction
 # ---------------------------------------------------------------------------
 
-def extract_zips_to_tempdir(uploaded_zips) -> tuple:
+def extract_zips(uploaded_zips, required_object_ids: set) -> tuple:
     """
-    Extract all uploaded ZIP files into a shared temp directory.
-    Returns (temp_dir_path, {object_id: full_file_path}, list_of_errors)
+    Extract only the required XML files from uploaded ZIPs into a temp dir.
+    Returns (file_map, errors)
+      file_map: {object_id: bytes}
+      errors:   list of error strings
     """
-    tmp = tempfile.mkdtemp()
-    file_map = {}   # object_id (without _public.xml) -> full path
+    file_map = {}
     errors = []
 
     for uploaded_zip in uploaded_zips:
@@ -215,18 +214,15 @@ def extract_zips_to_tempdir(uploaded_zips) -> tuple:
                 for name in zf.namelist():
                     if not name.endswith("_public.xml"):
                         continue
-                    basename = os.path.basename(name)
-                    obj_id = basename.replace("_public.xml", "")
-                    dest = os.path.join(tmp, basename)
-                    with zf.open(name) as src, open(dest, "wb") as dst:
-                        dst.write(src.read())
-                    file_map[obj_id] = dest
+                    obj_id = os.path.basename(name).replace("_public.xml", "")
+                    if obj_id in required_object_ids:
+                        file_map[obj_id] = zf.read(name)
         except zipfile.BadZipFile:
             errors.append(f"{uploaded_zip.name}: not a valid ZIP file")
         except Exception as e:
             errors.append(f"{uploaded_zip.name}: {e}")
 
-    return tmp, file_map, errors
+    return file_map, errors
 
 
 # ---------------------------------------------------------------------------
@@ -236,70 +232,46 @@ def extract_zips_to_tempdir(uploaded_zips) -> tuple:
 st.set_page_config(page_title="990 Foundation Explorer", layout="wide")
 st.title("990 Foundation Explorer")
 st.caption(
-    "Upload IRS 990/990PF ZIP archives and an index CSV to extract structured "
-    "data for a list of EINs."
+    "Upload an index CSV and paste EINs to find out which ZIPs you need, "
+    "then upload only those ZIPs to extract and export the data."
 )
 
-if "parsed_df" not in st.session_state:
-    st.session_state.parsed_df = None
-if "all_columns" not in st.session_state:
-    st.session_state.all_columns = []
-if "file_map" not in st.session_state:
-    st.session_state.file_map = {}
+# Session state
+for key, default in [
+    ("index_df", None),
+    ("filings", None),
+    ("required_batches", None),
+    ("file_map", {}),
+    ("parsed_df", None),
+    ("all_columns", []),
+    ("_zip_names_key", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # ---------------------------------------------------------------------------
-# Step 1: Uploads
+# Step 1: Index CSV + EINs
 # ---------------------------------------------------------------------------
-st.header("Step 1 — Upload Files")
+st.header("Step 1 — Index CSV & EINs")
 
 col_a, col_b = st.columns(2)
 
 with col_a:
-    uploaded_zips = st.file_uploader(
-        "990 XML ZIP archive(s)",
-        type="zip",
-        accept_multiple_files=True,
-        help="One or more ZIP files as downloaded from ProPublica / IRS bulk data. "
-             "Each ZIP should contain {OBJECT_ID}_public.xml files in a flat structure.",
-    )
-
-with col_b:
     uploaded_index = st.file_uploader(
         "Index CSV",
         type="csv",
         help="Must contain columns: EIN, OBJECT_ID (clean integer), XML_BATCH_ID",
     )
 
-# Extract ZIPs when uploaded (cached in session state by file identity)
-zip_names_key = tuple(sorted(f.name for f in uploaded_zips)) if uploaded_zips else ()
-if uploaded_zips and zip_names_key != st.session_state.get("_zip_names_key"):
-    with st.spinner(f"Extracting {len(uploaded_zips)} ZIP file(s)…"):
-        _, file_map, zip_errors = extract_zips_to_tempdir(uploaded_zips)
-    st.session_state.file_map = file_map
-    st.session_state["_zip_names_key"] = zip_names_key
-    if zip_errors:
-        for e in zip_errors:
-            st.error(e)
-    else:
-        st.success(f"{len(file_map):,} XML files extracted across {len(uploaded_zips)} ZIP(s).")
-
-if st.session_state.file_map:
-    st.caption(f"{len(st.session_state.file_map):,} XML files available.")
-
-# ---------------------------------------------------------------------------
-# Step 2: EINs + parse
-# ---------------------------------------------------------------------------
-st.header("Step 2 — Paste EINs & Parse")
-
-ein_input = st.text_area(
-    "EINs (one per line, dashes optional)",
-    height=180,
-    placeholder="237125454\n330759830\n933607439",
-)
+with col_b:
+    ein_input = st.text_area(
+        "EINs (one per line, dashes optional)",
+        height=200,
+        placeholder="237125454\n330759830\n933607439",
+    )
 
 eins_cleaned = [re.sub(r"\D", "", e.strip()) for e in ein_input.splitlines() if e.strip()]
 eins_cleaned = [e for e in eins_cleaned if e]
-
 seen = set()
 eins_deduped = []
 for e in eins_cleaned:
@@ -307,57 +279,110 @@ for e in eins_cleaned:
         seen.add(e)
         eins_deduped.append(e)
 
-if eins_deduped:
-    st.caption(f"{len(eins_deduped)} unique EIN(s) entered.")
-    if len(eins_cleaned) != len(eins_deduped):
-        st.warning(f"{len(eins_cleaned) - len(eins_deduped)} duplicate(s) removed.")
+if eins_deduped and len(eins_cleaned) != len(eins_deduped):
+    st.warning(f"{len(eins_cleaned) - len(eins_deduped)} duplicate EIN(s) removed.")
 
-inputs_ready = (
-    bool(st.session_state.file_map)
-    and uploaded_index is not None
-    and bool(eins_deduped)
-)
-
-if not inputs_ready:
-    missing = []
-    if not st.session_state.file_map:
-        missing.append("ZIP file(s)")
-    if uploaded_index is None:
-        missing.append("index CSV")
-    if not eins_deduped:
-        missing.append("EINs")
-    st.info(f"Still needed: {', '.join(missing)}.")
-else:
-    if st.button("Parse Files", type="primary"):
-        # Load index
+if uploaded_index and eins_deduped:
+    if st.button("Look Up EINs", type="primary"):
         try:
             index_df = load_index(uploaded_index)
         except Exception as e:
             st.error(f"Failed to load index CSV: {e}")
             st.stop()
 
-        # Match EINs to index rows
         filings = index_df[index_df[COL_EIN].isin(set(eins_deduped))].copy()
+
+        not_found = [e for e in eins_deduped if e not in filings[COL_EIN].values]
+        if not_found:
+            st.warning(f"{len(not_found)} EIN(s) not in index: {', '.join(not_found)}")
 
         if filings.empty:
             st.error("None of the supplied EINs were found in the index CSV.")
             st.stop()
 
-        not_found_in_index = [e for e in eins_deduped if e not in filings[COL_EIN].values]
-        if not_found_in_index:
-            st.warning(
-                f"{len(not_found_in_index)} EIN(s) not found in index: "
-                f"{', '.join(not_found_in_index)}"
-            )
+        st.session_state.index_df = index_df
+        st.session_state.filings = filings
+        st.session_state.required_batches = sorted(filings[COL_BATCH_ID].unique())
+        # Reset downstream state when EINs/index change
+        st.session_state.file_map = {}
+        st.session_state.parsed_df = None
+        st.session_state.all_columns = []
+        st.session_state._zip_names_key = None
+else:
+    if not uploaded_index:
+        st.info("Upload an index CSV to continue.")
+    elif not eins_deduped:
+        st.info("Enter at least one EIN to continue.")
 
-        # Parse matched XML files
+# ---------------------------------------------------------------------------
+# Step 2: Upload ZIPs
+# ---------------------------------------------------------------------------
+if st.session_state.required_batches is not None:
+    filings = st.session_state.filings
+    required_batches = st.session_state.required_batches
+    n_filings = len(filings)
+    n_eins = filings[COL_EIN].nunique()
+
+    st.header("Step 2 — Upload ZIP Files")
+    st.success(
+        f"Found {n_filings} filing(s) across {n_eins} EIN(s). "
+        f"You need to upload **{len(required_batches)}** ZIP file(s):"
+    )
+    for batch in required_batches:
+        n = len(filings[filings[COL_BATCH_ID] == batch])
+        st.markdown(f"- `{batch}.zip` — {n} filing(s)")
+
+    uploaded_zips = st.file_uploader(
+        "Upload the ZIP file(s) listed above",
+        type="zip",
+        accept_multiple_files=True,
+        help="Each ZIP should contain {OBJECT_ID}_public.xml files in a flat structure. Max 500MB per file.",
+    )
+
+    if uploaded_zips:
+        zip_names_key = tuple(sorted(f.name for f in uploaded_zips))
+        if zip_names_key != st.session_state._zip_names_key:
+            required_object_ids = set(st.session_state.filings[COL_OBJECT_ID].astype(str))
+            with st.spinner(f"Extracting {len(uploaded_zips)} ZIP file(s)…"):
+                file_map, zip_errors = extract_zips(uploaded_zips, required_object_ids)
+            st.session_state.file_map = file_map
+            st.session_state._zip_names_key = zip_names_key
+            # Reset parse state
+            st.session_state.parsed_df = None
+            st.session_state.all_columns = []
+            if zip_errors:
+                for e in zip_errors:
+                    st.error(e)
+
+        file_map = st.session_state.file_map
+        if file_map:
+            st.caption(f"{len(file_map):,} matching XML file(s) extracted from uploaded ZIPs.")
+
+            # Warn about any batches not yet covered by uploaded ZIPs
+            uploaded_zip_names = {f.name.replace(".zip", "") for f in uploaded_zips}
+            missing_batches = [b for b in required_batches if b not in uploaded_zip_names]
+            if missing_batches:
+                st.warning(
+                    f"ZIPs not yet uploaded for: {', '.join(missing_batches)}. "
+                    "Filings from those batches will show as missing."
+                )
+
+# ---------------------------------------------------------------------------
+# Step 3: Parse
+# ---------------------------------------------------------------------------
+if st.session_state.file_map:
+    st.header("Step 3 — Parse")
+
+    if st.button("Parse Files", type="primary"):
+        filings = st.session_state.filings
+        index_df = st.session_state.index_df
+        file_map = st.session_state.file_map
         all_rows = []
         file_errors = []
-        file_map = st.session_state.file_map
+        total = len(filings)
 
         progress = st.progress(0, text="Starting…")
         status = st.empty()
-        total = len(filings)
 
         for i, (_, idx_row) in enumerate(filings.iterrows()):
             ein = idx_row[COL_EIN]
@@ -374,12 +399,9 @@ else:
                     "_parse_error": "File not found in uploaded ZIPs",
                 })
             else:
-                with open(file_map[obj_id], "rb") as f:
-                    data = f.read()
-                rows = parse_xml_bytes(data, filename)
+                rows = parse_xml_bytes(file_map[obj_id], filename)
                 for r in rows:
                     r.setdefault("ReturnHeader.Filer.EIN", ein)
-                    # Carry through extra index columns as metadata
                     for col in index_df.columns:
                         if col not in {COL_EIN, COL_OBJECT_ID, COL_BATCH_ID}:
                             r.setdefault(f"_index.{col}", idx_row[col])
@@ -404,7 +426,7 @@ else:
                 st.dataframe(pd.DataFrame(file_errors), use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# Step 3: Field selection
+# Step 4: Field selection
 # ---------------------------------------------------------------------------
 if st.session_state.all_columns:
     df_full = st.session_state.parsed_df
@@ -413,7 +435,7 @@ if st.session_state.all_columns:
     internal_cols = [c for c in all_cols if c.startswith("_")]
     data_cols = [c for c in all_cols if not c.startswith("_")]
 
-    st.header("Step 3 — Select Fields")
+    st.header("Step 4 — Select Fields")
     st.write(
         f"{len(data_cols)} fields found across all parsed files. "
         "Uncheck anything you don't need in the export."
@@ -437,9 +459,9 @@ if st.session_state.all_columns:
         selected_cols.append("_parse_error")
 
     # ---------------------------------------------------------------------------
-    # Step 4: Preview + download
+    # Step 5: Export
     # ---------------------------------------------------------------------------
-    st.header("Step 4 — Export")
+    st.header("Step 5 — Export")
 
     if not selected_cols:
         st.warning("Select at least one field above.")
