@@ -41,6 +41,11 @@ import streamlit as st
 COL_EIN = "EIN"
 COL_OBJECT_ID = "OBJECT_ID"
 COL_BATCH_ID = "XML_BATCH_ID"
+COL_RETURN_TYPE = "RETURN_TYPE"
+
+# Return types available for filtering, with recommended defaults pre-selected
+ALL_RETURN_TYPES = ["990", "990EZ", "990PF", "990T", "990O"]
+DEFAULT_RETURN_TYPES = ["990", "990PF"]  # recommended for prospecting
 
 SKIP_TAGS = {
     "BuildTS", "softwareId", "softwareVersionNum", "returnVersion",
@@ -262,6 +267,18 @@ with col_a:
         type="csv",
         help="Must contain columns: EIN, OBJECT_ID (clean integer), XML_BATCH_ID",
     )
+    selected_return_types = st.multiselect(
+        "Return types to include",
+        options=ALL_RETURN_TYPES,
+        default=DEFAULT_RETURN_TYPES,
+        help=(
+            "990 = public charities & community foundations. "
+            "990PF = private foundations. "
+            "990EZ = smaller orgs (under $200K revenue). "
+            "990T = unrelated business income only — limited prospecting value. "
+            "Recommended: 990 and 990PF only."
+        ),
+    )
 
 with col_b:
     ein_input = st.text_area(
@@ -290,14 +307,39 @@ if uploaded_index and eins_deduped:
             st.error(f"Failed to load index CSV: {e}")
             st.stop()
 
-        filings = index_df[index_df[COL_EIN].isin(set(eins_deduped))].copy()
+        filings_all = index_df[index_df[COL_EIN].isin(set(eins_deduped))].copy()
 
-        not_found = [e for e in eins_deduped if e not in filings[COL_EIN].values]
+        not_found = [e for e in eins_deduped if e not in filings_all[COL_EIN].values]
         if not_found:
             st.warning(f"{len(not_found)} EIN(s) not in index: {', '.join(not_found)}")
 
-        if filings.empty:
+        if filings_all.empty:
             st.error("None of the supplied EINs were found in the index CSV.")
+            st.stop()
+
+        # Apply return type filter
+        if selected_return_types and COL_RETURN_TYPE in index_df.columns:
+            filings = filings_all[filings_all[COL_RETURN_TYPE].isin(selected_return_types)].copy()
+            excluded = len(filings_all) - len(filings)
+            if excluded:
+                excluded_types = filings_all.loc[
+                    ~filings_all[COL_RETURN_TYPE].isin(selected_return_types),
+                    COL_RETURN_TYPE,
+                ].value_counts().to_dict()
+                excluded_summary = ", ".join(f"{v}\u00d7 {k}" for k, v in excluded_types.items())
+                st.info(f"{excluded} filing(s) excluded by return type filter ({excluded_summary}).")
+        else:
+            filings = filings_all
+            if COL_RETURN_TYPE not in index_df.columns:
+                st.warning(
+                    f"Column '{COL_RETURN_TYPE}' not found in index CSV — return type filter not applied."
+                )
+
+        if filings.empty:
+            st.error(
+                "No filings remain after applying the return type filter. "
+                "Try including additional return types above."
+            )
             st.stop()
 
         st.session_state.index_df = index_df
